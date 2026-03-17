@@ -36,7 +36,7 @@ PHP_PRODUCT_COLUMNS = [
 STATUS_FILE = "process_status.json"
 AI_CACHE_FILE = "ai_cache.json"
 CAT_CACHE_FILE = "cat_cache.json"
-UPLOADS_DIR = "uploads" # Папка для збереження файлів
+UPLOADS_DIR = "uploads" 
 
 if not os.path.exists(UPLOADS_DIR):
     os.makedirs(UPLOADS_DIR)
@@ -165,16 +165,20 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
                     ai_cache[p_art] = json.loads(resp.choices[0].message.content)
                     with open(AI_CACHE_FILE, "w") as f: json.dump(ai_cache, f, ensure_ascii=False)
                 except Exception as e:
-                    raise Exception(f"Помилка OpenAI: {e}")
+                    print(f"[УВАГА] Помилка на товарі {p_art}: {e}. Пропускаємо!")
+                    # ЗБЕРІГАЄМО ПУСТИШКУ, ЩОБ РОЗІРВАТИ ЦИКЛ ПОМИЛОК!
+                    ai_cache[p_art] = {"desc_ua": orig_desc, "desc_meta_ua": "", "key_ua": "", "desc_ru": "", "desc_meta_ru": "", "key_ru": ""}
+                    with open(AI_CACHE_FILE, "w") as f: json.dump(ai_cache, f, ensure_ascii=False)
+                    continue # Йдемо далі, конвеєр не зупиняється
 
             for idx, row in df_main.iterrows():
                 p_art = str(row['Родительский артикул']).strip()
                 if p_art in ai_cache:
                     r = ai_cache[p_art]
-                    df_main.at[idx, 'Описание товара (UA)'] = str(r.get('desc_ua', ''))
+                    if r.get('desc_ua'): df_main.at[idx, 'Описание товара (UA)'] = str(r.get('desc_ua', ''))
                     df_main.at[idx, 'META description (UA)'] = str(r.get('desc_meta_ua', ''))
                     df_main.at[idx, 'META keywords (UA)'] = str(r.get('key_ua', ''))
-                    df_main.at[idx, 'Описание товара (RU)'] = str(r.get('desc_ru', ''))
+                    if r.get('desc_ru'): df_main.at[idx, 'Описание товара (RU)'] = str(r.get('desc_ru', ''))
                     df_main.at[idx, 'META description (RU)'] = str(r.get('desc_meta_ru', ''))
                     df_main.at[idx, 'META keywords (RU)'] = str(r.get('key_ru', ''))
         else:
@@ -209,7 +213,12 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
                         c = json.loads(resp.choices[0].message.content)
                         cat_cache[cat] = c
                         with open(CAT_CACHE_FILE, "w") as f: json.dump(cat_cache, f, ensure_ascii=False)
-                    except Exception as e: raise Exception(f"Помилка OpenAI: {e}")
+                    except Exception as e: 
+                        print(f"[УВАГА] Помилка на категорії {cat}: {e}. Пропускаємо!")
+                        c = {"h1_ru": cat_clean_name, "text_ua": "", "title_ua": "", "desc_ua": "", "key_ua": "", "text_ru": "", "title_ru": "", "desc_ru": "", "key_ru": ""}
+                        cat_cache[cat] = c
+                        with open(CAT_CACHE_FILE, "w") as f: json.dump(cat_cache, f, ensure_ascii=False)
+                        # continue не треба, бо це останній блок у циклі
                 
                 ru_name = c.get("h1_ru", cat_clean_name).strip()
                 ru_name_lower = ru_name.lower()
@@ -257,6 +266,7 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
         save_status(done=True, is_running=False, start_time=start_t, stats=stats_info)
         
     except Exception as e:
+        # СЮДИ БОТ ПОТРАПИТЬ ТІЛЬКИ ЯКЩО СТАНЕТЬСЯ КРИТИЧНА СИСТЕМНА ПОМИЛКА, А НЕ ШІ
         save_status(error=str(e), is_running=False, current=curr_step, total=total_steps)
         send_telegram_results(f"❌ Роботу зупинено: {e}")
 
@@ -298,35 +308,29 @@ def main():
     st.markdown("<h1>🏍️ MotoImport AI: Автономний Конвеєр</h1>", unsafe_allow_html=True)
     status = load_status()
     
-    # Перевіряємо, чи є збережені файли від попередньої спроби
     main_saved_path = os.path.join(UPLOADS_DIR, "31.xlsx")
     spec_saved_path = os.path.join(UPLOADS_DIR, "specifications.xlsx")
     has_saved_files = os.path.exists(main_saved_path) and os.path.exists(spec_saved_path)
     is_paused = status.get('error') is not None or (status.get('current_idx', 0) > 0 and not status['is_running'] and not status['done'])
 
     if not status['is_running'] and not status['done']:
-        
-        # ЯКЩО Є ПЕРЕРВАНА СЕСІЯ І ФАЙЛИ ЗБЕРЕЖЕНІ
         if is_paused and has_saved_files:
             st.warning(f"⚠️ Виявлено перервану сесію! Робота зупинилася на кроці {status.get('current_idx', 0)} з {status.get('total', 0)}.")
             st.info("Вам не потрібно завантажувати файли наново. Вони надійно збережені в пам'яті.")
         else:
-            # СТАНДАРТНИЙ ЗАВАНТАЖУВАЧ ФАЙЛІВ
             with st.container(border=True):
                 c1, c2 = st.columns(2)
-                with c1: main_file = st.file_uploader("Завантаж (Товари)", type=["xlsx"])
+                with c1: main_file = st.file_uploader("Завантаж 31.xlsx (Товари)", type=["xlsx"])
                 with c2: spec_file = st.file_uploader("Specifications", type=["xlsx"])
 
-        # НАЛАШТУВАННЯ (ДОСТУПНІ ЗАВЖДИ)
         with st.expander("⚙️ Налаштування обробки", expanded=True):
             cs1, cs2 = st.columns(2)
             with cs1:
                 in_stock_only = st.checkbox("✅ Тільки в наявності", value=True)
-                ai_on = st.checkbox("🤖 Активувати ChatGPT", value=True) # Рекомендуємо тримати увімкненим
+                ai_on = st.checkbox("🤖 Активувати ChatGPT", value=True)
             with cs2:
                 limit = st.selectbox("Ліміт рядків для обробки:", [10, 100, 500, 1000, 5000, "Всі"], index=5)
 
-        # КНОПКИ КЕРУВАННЯ
         c_start, c_clear = st.columns([3, 1])
         with c_start:
             if is_paused and has_saved_files:
@@ -338,7 +342,6 @@ def main():
                 st.markdown('<div class="btn-start">', unsafe_allow_html=True)
                 if st.button("🚀 ЗАПУСТИТИ КОНВЕЄР"):
                     if main_file and spec_file:
-                        # ЗБЕРЕЖЕННЯ ФАЙЛІВ НА ДИСК ДЛЯ СТРАХОВКИ
                         with open(main_saved_path, "wb") as f: f.write(main_file.getvalue())
                         with open(spec_saved_path, "wb") as f: f.write(spec_file.getvalue())
                         start_pipeline(main_saved_path, spec_saved_path, limit, in_stock_only, ai_on)
@@ -376,7 +379,7 @@ def main():
             with cl3:
                 if os.path.exists("output/categories_seo.xlsx"): st.download_button("🏷️ SEO Категорії", open("output/categories_seo.xlsx", "rb"), "categories_seo.xlsx")
             if st.button("🔄 Новий запит"): 
-                if os.path.exists(UPLOADS_DIR): shutil.rmtree(UPLOADS_DIR) # Видаляємо старі файли
+                if os.path.exists(UPLOADS_DIR): shutil.rmtree(UPLOADS_DIR)
                 save_status(is_running=False, done=False)
                 st.rerun()
 
