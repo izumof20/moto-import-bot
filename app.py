@@ -9,6 +9,7 @@ import requests
 import threading
 import shutil
 import difflib
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -16,6 +17,15 @@ from bs4 import BeautifulSoup
 # Налаштування SSL
 ssl._create_default_https_context = ssl._create_unverified_context
 load_dotenv()
+
+# --- РЕГУЛЯРНИЙ ВИРАЗ ДЛЯ ОЧИЩЕННЯ НАЗВ ВІД РОЗМІРІВ ---
+SIZE_PATTERN = re.compile(r'\s+\b(XXS|XS|S|M|L|XL|XXL|2XL|XXXL|3XL|XXXXL|4XL|XXXXXL|5XL|[3-6]\d)\b$', re.IGNORECASE)
+
+def clean_title_smart(title):
+    title_str = str(title).strip()
+    if pd.isna(title) or title_str == 'nan' or not title_str:
+        return title
+    return SIZE_PATTERN.sub('', title_str).strip()
 
 # --- СТРУКТУРА СТОВПЧИКІВ ДЛЯ PHP ІМПОРТУ (СУВОРИЙ ПОРЯДОК 0-63) ---
 PHP_PRODUCT_COLUMNS = [
@@ -166,10 +176,9 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
                     with open(AI_CACHE_FILE, "w") as f: json.dump(ai_cache, f, ensure_ascii=False)
                 except Exception as e:
                     print(f"[УВАГА] Помилка на товарі {p_art}: {e}. Пропускаємо!")
-                    # ЗБЕРІГАЄМО ПУСТИШКУ, ЩОБ РОЗІРВАТИ ЦИКЛ ПОМИЛОК!
                     ai_cache[p_art] = {"desc_ua": orig_desc, "desc_meta_ua": "", "key_ua": "", "desc_ru": "", "desc_meta_ru": "", "key_ru": ""}
                     with open(AI_CACHE_FILE, "w") as f: json.dump(ai_cache, f, ensure_ascii=False)
-                    continue # Йдемо далі, конвеєр не зупиняється
+                    continue
 
             for idx, row in df_main.iterrows():
                 p_art = str(row['Родительский артикул']).strip()
@@ -218,7 +227,6 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
                         c = {"h1_ru": cat_clean_name, "text_ua": "", "title_ua": "", "desc_ua": "", "key_ua": "", "text_ru": "", "title_ru": "", "desc_ru": "", "key_ru": ""}
                         cat_cache[cat] = c
                         with open(CAT_CACHE_FILE, "w") as f: json.dump(cat_cache, f, ensure_ascii=False)
-                        # continue не треба, бо це останній блок у циклі
                 
                 ru_name = c.get("h1_ru", cat_clean_name).strip()
                 ru_name_lower = ru_name.lower()
@@ -266,7 +274,6 @@ def background_worker(df_main, df_spec, use_ai, api_key, output_dir, stats_info)
         save_status(done=True, is_running=False, start_time=start_t, stats=stats_info)
         
     except Exception as e:
-        # СЮДИ БОТ ПОТРАПИТЬ ТІЛЬКИ ЯКЩО СТАНЕТЬСЯ КРИТИЧНА СИСТЕМНА ПОМИЛКА, А НЕ ШІ
         save_status(error=str(e), is_running=False, current=curr_step, total=total_steps)
         send_telegram_results(f"❌ Роботу зупинено: {e}")
 
@@ -296,8 +303,32 @@ def start_pipeline(main_path, spec_path, limit, in_stock_only, ai_on):
     df_supplier, df_spec = pd.read_excel(main_path), pd.read_excel(spec_path)
     df_supplier.columns = df_supplier.columns.astype(str).str.strip()
     df_main = df_supplier.copy()
-    if in_stock_only: df_main = df_main[~df_main['Наличие'].astype(str).str.lower().str.contains('немає|нет', na=False)].copy()
+    
+    # === ОЧИЩЕННЯ НАЗВ ТОВАРІВ ВІД РОЗМІРІВ ===
+    if 'Название (UA)' in df_main.columns:
+        df_main['Название (UA)'] = df_main['Название (UA)'].apply(clean_title_smart)
+    if 'Название (RU)' in df_main.columns:
+        df_main['Название (RU)'] = df_main['Название (RU)'].apply(clean_title_smart)
+    # ==========================================
+
+    # === ЖЕСТКАЯ ПРИВЯЗКА КАТЕГОРИИ "КОФРЫ" К РОДИТЕЛЮ ===
+    if 'Раздел' in df_main.columns:
+        df_main['Раздел'] = df_main['Раздел'].astype(str).apply(
+            lambda cat: f"Мотоаксесуари/{cat.strip()}" if cat.strip().startswith("Кофри, сумки, рюкзаки") else cat
+        )
+    # =====================================================
+    
+    # --- РОЗУМНИЙ ФІЛЬТР НАЯВНОСТІ ---
+    if in_stock_only: 
+        in_stock_mask = ~df_main['Наличие'].astype(str).str.lower().str.contains('немає|нет', na=False)
+        valid_parents = df_main[in_stock_mask]['Родительский артикул'].unique()
+        is_parent_mask = df_main['Артикул'].astype(str).str.strip() == df_main['Родительский артикул'].astype(str).str.strip()
+        is_valid_parent_row = is_parent_mask & df_main['Родительский артикул'].isin(valid_parents)
+        df_main = df_main[in_stock_mask | is_valid_parent_row].copy()
+    # ---------------------------------
+
     if limit != "Всі": df_main = df_main.head(int(limit)).copy()
+    
     p_check = df_main[df_main['Артикул'].astype(str).str.strip() == df_main['Родительский артикул'].astype(str).str.strip()]
     if p_check.empty and not df_main.empty: p_check = df_main.drop_duplicates(subset=['Родительский артикул'])
     stats = {'supplier_total': len(df_supplier), 'processed_in_stock': len(df_main), 'processed_parents': len(p_check), 'processed_cats': df_main['Раздел'].nunique()}
